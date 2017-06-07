@@ -1,0 +1,251 @@
+---
+title: "STATS 418 HW 4"
+author: "Jordan Berninger"
+date: "June 6, 2017"
+output: html_document
+---
+```{r, echo = FALSE, include = FALSE}
+library(dplyr)
+library(ggplot2)
+library(readr)
+library(glmnet)
+library(ROCR)
+library(pROC)
+library(h2o)
+
+```
+
+Introduction:
+
+I am going to fit several more models on the Museum of Modern Art Collection dataset. Recall that this data set has the gender of the artist as the response variable and it takes the other columns as input. In homework 3, we fit several Lasso Regression, Random Forests, and GBM models. Now, we are going to fit several Nerual Networks, manipulating parameters including activation and learning rate. Next, we will perform hyperparameter optimization on GBMs. Then, we will ensemble several models. Finally, we will evaluate the all the models that we fit on the data, selecting the best one. As always, we will record performance metrics and produce plots where possible.
+
+
+_______________________________________________________________
+
+
+The Data:
+
+First thing is to load the data, and to split the data into training, validation and test sets. Since we are fitting models through the h2o architecture, we need to use this package's specific data format. It is worth noting that I am using a slightly different version of RStudio and h2o than the somputer in class, as I have had to modify the neural network github code slightly.
+
+```{r}
+
+artists <- read.csv("~/Desktop/artists.csv", header = TRUE)
+artworks <- read.csv("~/Desktop/artworks.csv", header = TRUE)
+artworks$Date <- as.Date(artworks$Date, "%Y")
+artworks <- mutate(artworks, Acquisition.Diff = as.Date(artworks$Acquisition.Date) - as.Date(artworks$Date, "%Y"))
+artists <- mutate(artists, Death.Status = as.factor(ifelse(is.na(artists$Death.Year), "0", "1")))
+art.art <- merge(artworks, artists, by = "Artist.ID")
+art.art <- subset(art.art, select = c(Gender, Date, Credit, Catalogue, 
+                                      Acquisition.Date,
+                                      Department, Nationality, Birth.Year,
+                                      Death.Status))
+
+art.art <- subset(art.art, !art.art$Gender=="")
+art.art <- subset(art.art, !art.art$Gender=="male")
+art.art$Gender <- as.factor(ifelse(art.art$Gender=="Female", 0, 1))
+art.art <- na.omit(art.art)
+
+library(h2o)
+localh2o <- h2o.init(nthreads=-1, min_mem_size="2g", max_mem_size="3g")
+# you hit errors if you open one on top of another
+setwd("~/Desktop")
+dx <- h2o.importFile("moma.csv")
+dx_split <- h2o.splitFrame(dx, ratios = c(0.6,0.2), seed=123)
+dx_train <- dx_split[[1]]
+dx_valid <- dx_split[[2]]
+dx_test <- dx_split[[3]]
+Xnames <- names(dx_train)[which(names(dx_train)!="Gender")]
+```
+
+This is our cleaned dataset, in the proper format for h2o.
+
+__________________________________________________
+
+
+Neural Networks:
+
+As I stated before, I am using a slightly different version of h2o, so I have a different set of parameters for the h2o.deeplearning() model. My version does not have the following parameters we explored in class, $stopping_rounds, stopping_metric, or stopping_tolerance$. Some other parameters have different names, so these needed to be switched too. It is also noteworthy that this version of h2o does not have a parameter related to early stopping.
+
+The first deep learning model I am fitting will be similar to the one we used in class. I have removed the stopping parameters. In later models, we will tweak the $adaptive_rate$ parameter, so it is worth noting that the default value for $adaptive_rate$ is ADADELTA, which is related to gradient descent. We fit the model and record its performance on the test set. This model took quite long to train, as you can see.
+
+```{r}
+system.time({
+  dl1 <- h2o.deeplearning(x = Xnames, y = "Gender", training_frame = dx_train, validation_frame = dx_valid,
+                         activation = "Rectifier", hidden = c(50,50), 
+                         epochs = 10, stopping_rounds = 2, stopping_metric = "MSE", stopping_tolerance = 0) 
+})
+dl1@model$training_metrics
+dl1@model$validation_metrics
+h2o.performance(dl1, dx_test)@metrics$MSE
+
+```
+
+Now, I will keep the activation and hidden layers constant, but I will decativate the ADADELTA $adaptive_rate$, and will manually set values for $rate$ and $rate_annealing$ (I looked at models on the internet to get an idea of the range of reasonable values for these parameters). This model also longer than the previous model to train.
+
+
+```{r}
+system.time({
+  dl2 <- h2o.deeplearning(x = Xnames, y = "Gender", training_frame = dx_train, validation_frame = dx_valid,
+                          activation = "Rectifier", hidden = c(50,50), 
+                          epochs = 10, adaptive_rate = FALSE, rate = 0.01, rate_annealing=2e-6,
+                          stopping_rounds = 2, stopping_metric = "MSE", stopping_tolerance = 0) 
+})
+dl2@model$training_metrics
+dl2@model$validation_metrics
+h2o.performance(dl2, dx_test)@metrics$MSE
+```
+
+Now, we will return to the first neural network we fit, and will change the $activation$ parameter from "Rectifier" to "RectifierWithDropout". I don't expect this change to profoundly inpat model performance or training time.
+
+```{r}
+system.time({
+  dl3 <- h2o.deeplearning(x = Xnames, y = "Gender", training_frame = dx_train, validation_frame = dx_valid,
+                         activation = "RectifierWithDropout", hidden = c(50,50), 
+                         epochs = 10, stopping_rounds = 2, stopping_metric = "MSE", stopping_tolerance = 0) 
+})
+dl3@model$training_metrics
+dl3@model$validation_metrics
+h2o.performance(dl3, dx_test)@metrics$MSE
+```
+
+Since we did not cover Maxout in class, I will fit a fourth and final deep learning model on the data. We will keep the default ADADELTA activation rate, but will change the activation algorithm to "MaxoutWithDropout".
+
+```{r}
+system.time({
+  dl4 <- h2o.deeplearning(x = Xnames, y = "Gender", training_frame = dx_train, validation_frame = dx_valid,
+                         activation = "MaxoutWithDropout", hidden = c(50,50), 
+                         epochs = 10, stopping_rounds = 2, stopping_metric = "MSE", stopping_tolerance = 0) 
+})
+dl4@model$training_metrics
+dl4@model$validation_metrics
+h2o.performance(dl4, dx_test)@metrics$MSE
+```
+
+From the output, we can see which model performed best on the training, validation and test sets. 
+
+
+_________________________________________________________________
+
+
+GBM Hyper-parameter Search
+
+We will follow the model from class to perform hyperparameter search. For the sake of computation time, I reduced the maximum values of some of the parameters, including $max_depth$ of the trees (high values of this parameter have broken my R session). For the hyperparmeter search, we first create a list of the hyperparameters we want to manipulate, and we provide ranges for their values that we want to investigate. We then define a search criteria with strategy (we looked at grid, random guess strategies in class) and the max number of models. We then generate a grid of models, order them by a performance metric, and then return the best model (by its performance on the training and validation datasets). We then see how this model performs on the test data.
+
+```{r, echo = FALSE}
+
+hyper_params <- list( ntrees = 50,  ## early stopping
+                     max_depth = c(3,5), 
+                     min_rows = c(1,3,5),
+                     learn_rate = c(0.05,0.1),  
+                     learn_rate_annealing = c(0.95,1),
+                     sample_rate = c(0.4,1),
+                     col_sample_rate = c(0.7,1),
+                     nbins = c(30,50),
+                     nbins_cats = c(8,16)
+)
+
+search_criteria <- list( strategy = "RandomDiscrete",
+                        max_runtime_secs = 10*900,
+                        max_models = 100
+)
+
+system.time({
+  mds <- h2o.grid(algorithm = "gbm", grid_id = "grd2",
+                  x = Xnames, y = "Gender", training_frame = dx_train,
+                  validation_frame = dx_valid,
+                  hyper_params = hyper_params,
+                  search_criteria = search_criteria,
+                  stopping_metric = "MSE", stopping_rounds = 2,
+                  seed = 123)
+})
+mds_sort <- h2o.getGrid(grid_id = "grd2", sort_by = "mse", decreasing = TRUE)
+md_best <- h2o.getModel(mds_sort@model_ids[[1]])
+
+```
+
+Now, we return the summary and test MSE of the optimized model:
+
+```{r}
+summary(md_best)
+h2o.mse(h2o.performance(md_best, dx_test))
+```
+
+
+Unsurprisingly, this code took a long time to run. We are training, validating, and recording the results of many models in one, realatively intuitive chunk of code which is very powerful. In this grid search, I kept the parameter values low for resource considerations, but in a company with greater resuorces, one could expand the hyper-parameter ranges and run the analysis on a more powerful system.
+
+It is worth noting that the code on github used AUC as a stopping metric for these models. When I tried this, I hit the error "ERRR on field: stopping_metric: Stopping metric cannot be AUC for regression", which is peculiar. AUC could not be used for a sorting metric either, I saw "Invalid argument for sort_by specified. Must be one of: [rmse, residual_deviance, mae, rmsle, r2, mse]" when I tried. I continued with MSE as the stopping and sorting metric.
+
+
+_________________________________________________________________
+
+
+Ensemble
+
+Now, we want to create an ensemble model. h2o is a nice tool for thism, because it supports lots of different models and therefore requires minimal data manipulation for all the models to work. For this ensemble, we will fit some new GLM, Random Forest, GBM and Deep Learning models. I was hitting some issues with the GBM and Random Forest Models, I keep seeing an error message "ERRR on field: _ntrees: The tree model will not fit in the driver node's memory (315.5 KB per tree x 50 > Zero  ) - try decreasing ntrees and/or max_depth or increasing min_rows!". I get this message even with very few trees, so I don't know exactly what's wrong :( 
+
+```{r}
+dx_split <- h2o.splitFrame(dx, ratios = 0.7, seed = 456)
+dx_train <- dx_split[[1]]
+dx_test <- dx_split[[2]]
+Xnames <- setdiff(names(dx_train),"Gender")
+dx_train$Gender <- as.factor(dx_train$Gender)
+dx_test$Gender <- as.factor(dx_test$Gender)
+
+system.time({
+  md1 <- h2o.glm(x = Xnames, y = "Gender", training_frame = dx_train,
+                 family = "binomial", 
+                 alpha = 1, lambda = 0,
+                 seed = 456,
+                 nfolds = 3, fold_assignment = "Modulo", keep_cross_validation_predictions = TRUE)
+})
+# this was OK
+
+system.time({
+  md2 <- h2o.glm(x = Xnames, y = "Gender", training_frame = dx_train,
+                 family = "binomial", 
+                 alpha = .5, lambda = .5,
+                 seed = 456,
+                 nfolds = 3, fold_assignment = "Modulo", keep_cross_validation_predictions = TRUE)
+})
+
+#system.time({
+#  md3 <- h2o.randomForest(x = Xnames, y = "Gender", training_frame = dx_train, 
+#                ntrees = 5,
+#                seed = 456,
+#                nfolds = 5, fold_assignment = "Modulo", keep_cross_validation_predictions = TRUE)
+#})
+
+system.time({
+  md4 <- h2o.deeplearning(x = Xnames, y = "Gender", training_frame = dx_train, 
+                          epochs = 1,
+                          seed = 456,
+                          nfolds = 3, fold_assignment = "Modulo", keep_cross_validation_predictions = TRUE) 
+})
+
+md_ens <- h2o.stackedEnsemble(x = Xnames, y = "Gender", training_frame = dx_train, 
+                              base_models = list(md1@model_id, md2@model_id, md4@model_id))
+
+```
+
+Now that we have created the ensemble, lets look at its test performance next to that of its constintuent models. We will also look at the contributions of each model to the ensemble. 
+
+```{r}
+h2o.mse(h2o.performance(md1, dx_test))
+h2o.mse(h2o.performance(md2, dx_test))
+h2o.mse(h2o.performance(md4, dx_test))
+h2o.getModel(md_ens@model$metalearner$name)@model$coefficients_table
+```
+
+
+_________________________________________________________________
+
+
+Conclusion
+
+It was pretty satisfying fitting all of these models and seeing how they perform on this data. I hit a few issues generating AUC as a performance metric from the models in HW 3, so I still have some things to iron out before I can clearly rank the all the models' performance. 
+
+I think that the best model is determined by the exact application. The hyper-parameter optimization with the grid search is a very powerful tool, as it determines the optimal parameters, however, this model may be too computationally intensive to run in real-time, in production. In such cases, a quicker model, like random forest, may perform almost as well, but in a fraction of the time. 
+
+I think that ensemble models are very powerful and robust, as they take some aspects of all the models. As anapproach, it cannot hurt, because it can always assign a model weight of 1 to the best and 0 to all others if that is indeed the best model. I personally think that performing hyperparameter optimization on the various model classes (GBM, GLM, RF, DL, SVM), and then putting the resulting models into an ensemble seems to be a solid strategy to get high predictive accuracy. 
+
+In terms of tools, h2o is a great package. I have hit some issues with it, but I think they are all surmountable. H2O gives all the models a common syntax, and doesn't require any reformatting of the datasets. You can easily give all the models that same training, validation and test datasets, or you can have them all cross-validate wih the same folds and randomization seed. This is really powerful, because you know the performance metrics are coming from the same exact data. In h2o, it is also very easy to see if the modern machine learning algorithms outperform classic regression and classification models; this makes it easy to show co-workers or colleagues the improvement over traditional methods.
